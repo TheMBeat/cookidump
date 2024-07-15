@@ -11,7 +11,10 @@ import time
 import json
 import pathlib
 import argparse
-import platform
+import base64
+from getpass import getpass
+import base64
+from getpass import getpass
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from urllib.parse import urlparse
@@ -25,13 +28,15 @@ from selenium.webdriver.common.action_chains import ActionChains
 PAGELOAD_TO = 3
 SCROLL_TO = 1
 MAX_SCROLL_RETRIES = 5
+COOKIES_FILE = 'cookies.json'
 
-def startBrowser(chrome_driver_path):
+def startBrowser(chrome_driver_path, headless = False):
     """Starts browser with predefined parameters"""
     chrome_options = Options()
     if "GOOGLE_CHROME_PATH" in os.environ:
         chrome_options.binary_location = os.getenv('GOOGLE_CHROME_PATH')
-    #chrome_options.add_argument('--headless')
+    if headless:
+        chrome_options.add_argument('--headless')
     chrome_service = Service(chrome_driver_path)
     driver = webdriver.Chrome(service=chrome_service, options=chrome_options)
     return driver
@@ -87,34 +92,200 @@ def recipeToJSON(browser, recipeID):
 
     return recipe
 
-def run(webdriverfile, outputdir, separate_json):
+def recipeToPdf(browser, filename):
+    """Gets html of the recipe and saves in pdf file"""
+    send_devtools(browser, "Emulation.setEmulatedMedia", {'media': 'screen'})
+    printOutput = send_devtools(browser, "Page.printToPDF", {
+        "paperWidth": 210 / 25.4,
+        "paperHeight": 297 / 25.4,
+        "scale": 0.45,
+        "displayHeaderFooter": False,
+        "printBackground": False,
+        "marginTop": 0.1,
+        "marginRight": 0.1,
+        "marginBottom": 0.1,
+        "marginLeft": 0.1
+    })
+    with open(filename, 'wb') as outfile: 
+        outfile.write( base64.b64decode(printOutput['data']))
+
+def send_devtools(driver, cmd, params={}):
+  """Send devtools command with params to browser, used to export in pdf"""
+  resource = "/session/%s/chromium/send_command_and_get_result" % driver.session_id
+  url = driver.command_executor._url + resource
+  body = json.dumps({'cmd': cmd, 'params': params})
+  response = driver.command_executor._request('POST', url, body)
+  if 'status' in response:
+    raise Exception(response.get('value'))
+  return response.get('value')
+
+def cleanHtml(browser):
+
+    #remove header and residual margin
+    try: removeElements(browser, By.TAG_NAME, 'header')
+    except: pass
+    try: runActionOnElements(browser, By.CLASS_NAME, 'l-header-offset-small', 'setAttribute("style","margin-top: 0 !important")')
+    except: pass
+    
+    #remove footer
+    try: removeElements(browser, By.TAG_NAME, 'core-footer')
+    except: pass
+    
+    #remove alternative recipes
+    try: removeElements(browser, By.ID, 'alternative-recipes')
+    except: pass
+    
+    #remove sharing banner
+    try: removeElements(browser, By.ID, 'core-share')
+    except: pass
+    
+    #remove common collections
+    try: removeElements(browser, By.ID, 'in-collections')
+    except: pass
+    
+    #remove recipe actions (e.g. add to my recipes/my week)
+    try: removeElements(browser, By.CLASS_NAME, 'recipe-card__btn-line')
+    except: pass
+    
+    #disable serving size modal
+    try: removeClassFromElements(browser, By.ID, 'serving-size-modal-trigger','core-feature-icons__item--large-rectangle')
+    except: pass
+
+    #disable serving size modal
+    try: removeClassFromElements(browser, By.ID, 'serving-size-modal-trigger','core-feature-icons__item--large-rectangle')
+    except: pass
+    try: removeClassFromElements(browser, By.CSS_SELECTOR, 'core-feature-icons .core-feature-icons__icon','core-feature-icons__icon')
+    except: pass
+
+    #expand tags, remove expand/collapse links and override hrefs
+    try: runActionOnElements(browser, By.CSS_SELECTOR, 'core-tags-wrapper .core-tags-wrapper__wrapper', 'setAttribute("style","max-height: 100% !important")')
+    except: pass
+    try: removeElements(browser,By.CSS_SELECTOR, 'core-tags-wrapper .link--subsequent')
+    except: pass
+    try: removeElements(browser,By.CSS_SELECTOR, 'core-tags-wrapper .link--subsequent')
+    except: pass
+    try: runActionOnElements(browser, By.CSS_SELECTOR, 'core-tags-wrapper a', 'href="#";')
+    except: pass
+
+    #remove cookie banner and scripts
+    try: removeElements(browser, By.ID, '#onetrust-consent-sdk')
+    except: pass
+    try: removeElements(browser, By.CSS_SELECTOR, 'script[src*="otSDKStub"]')
+    except: pass
+
+def removeElements(browser, byQuery, query):
+    runActionOnElements(browser, byQuery, query, 'parentNode.removeChild(item);')
+
+def removeClassFromElements(browser, byQuery, query, classToRemove):
+    runActionOnElements(browser, byQuery, query, 'classList.remove("'+classToRemove+'")')
+
+def runActionOnElements(browser, byQuery, query, action):
+    browser.execute_script("arguments[0].forEach(function(item) {item."+ action + "})", browser.find_elements(byQuery, query))
+
+def isAuthenticated(browser):
+    return browser.get_cookie("v-authenticated") is not None
+
+def run(webdriverfile, outputdir, subdir, separate_json, searchquery, locale, pdf = False, save_cookies = False, headless = False, login = False):
     """Scraps all recipes and stores them in html"""
     print('[CD] Welcome to cookidump, starting things off...')
     # fixing the outputdir parameter, if needed
     if outputdir[-1:][0] != '/': outputdir += '/'
-    locale = str(input('[CD] Complete the website domain: https://cookidoo.'))
+    
+    if locale is None:
+        locale = str(input('[CD] Complete the website domain: https://cookidoo.'))
+    else:
+        print('[CD] Locale argument set, going to https://cookidoo.{}'.format(locale))
+
     baseURL = 'https://cookidoo.{}/'.format(locale)
-    brw = startBrowser(webdriverfile)
-    # opening the home page
+
+    if not save_cookies:
+        try: 
+            with open(COOKIES_FILE, 'r') as infile: 
+                cookies = json.load(infile)
+                print('[CD] {} file found and parsed'.format(COOKIES_FILE))
+        except FileNotFoundError: 
+            if headless and not login:
+                print('[CD] Error: {} file not found, please run cookidump with --save-cookies or --login.'.format(COOKIES_FILE))
+                exit(-1)
+            cookies = None
+        except:
+            print('[CD] Error: {} file not valid, please check - or delete - it, and run cookidump with --save-cookies again'.format(COOKIES_FILE))
+            exit(-1)
+    else:
+        cookies = None
+    
+    brw = startBrowser(webdriverfile, headless)
+
+    # try opening the profile url and check if authenticated
     brw.get(baseURL)
     time.sleep(PAGELOAD_TO)
-    reply = input('[CD] Please login to your account and then enter y to continue: ')
-    # recipes base url
-    rbURL = 'https://cookidoo.{}/search/'.format(locale)
-    brw.get(rbURL)
-    time.sleep(PAGELOAD_TO)
-    # possible filters done here
-    reply = input('[CD] Set your filters, if any, and then enter y to continue: ')
-    # asking for additional details for output organization
-    custom_output_dir = input("[CD] enter the directory name to store the results (ex. vegeratian): ")
-    if custom_output_dir : outputdir += '{}/'.format(custom_output_dir)
-    # proceeding
-    print('[CD] Proceeding with scraping')
-    # removing the name
-    brw.execute_script("var element = arguments[0];element.parentNode.removeChild(element);", brw.find_element(By.TAG_NAME, 'core-user-profile'))
-    # clicking on cookie accept
-    try: brw.find_element(By.CLASS_NAME, 'accept-cookie-container').click()
+
+    if (cookies is not None):
+        try:
+            # inject cookies
+            print('[CD] Injecting cookies')
+            for cookie in cookies:
+                brw.add_cookie(cookie)
+        except:
+            print('[CD] Error: {} file not valid, please check - or delete - it, and run cookidump with --save-cookies again'.format(COOKIES_FILE))
+            exit(-1)
+    else:
+        print('[CD] Cookies not found, proceeding with login')
+        
+    while (not isAuthenticated(brw)):
+        if login:
+            # login
+            print('[CD] Logging in')
+            brw.get(baseURL + 'profile/login')
+            time.sleep(PAGELOAD_TO)
+            if 'CAPTCHA' in brw.page_source:
+                print('[CD] Error: CAPTCHA detected, please login manually and then run cookidump with --save-cookies')
+                exit(-1)
+            brw.find_element(By.ID, 'email').send_keys(input('[CD] Enter your email: '))
+            brw.find_element(By.ID, 'password').send_keys(getpass('[CD] Enter your password: '))
+            brw.find_element(By.CSS_SELECTOR, '#login_form_id button').click()
+            time.sleep(PAGELOAD_TO)
+        else:
+           reply = input('[CD] Not authenticated, please login to your account and then enter y to continue: ')
+
+    if save_cookies:
+        with open(COOKIES_FILE, 'w') as outfile: json.dump(brw.get_cookies(), outfile)
+        print('[CD] Cookies saved to {}, please re-run cookidump without --save-cookies'.format(COOKIES_FILE))
+        return
+
+    # clicking on cookie reject
+    try: brw.find_element(By.ID, 'onetrust-reject-all-handler').click()
     except: pass
+
+    # recipes base url
+    rbURL = 'https://cookidoo.{}'.format(locale)
+
+    if searchquery is None:
+        rbURL += '/search'
+        brw.get(rbURL)
+        time.sleep(PAGELOAD_TO)
+        
+        # possible filters done here
+        reply = input('[CD] Set your filters, if any, and then enter y to continue: ')
+    else:
+        rbURL += searchquery
+        brw.get(rbURL)
+        time.sleep(PAGELOAD_TO)
+
+    if subdir is None:
+        custom_output_dir = input("[CD] enter the directory name to store the results (ex. vegetarian): ")
+    else:
+        custom_output_dir = subdir
+    if custom_output_dir : outputdir += '{}/'.format(custom_output_dir)
+
+    print('[CD] Proceeding with scraping page {}'.format(brw.current_url))
+
+    # removing the base href header
+    removeElements(brw,By.TAG_NAME, 'base')
+
+    # removing the name
+    removeElements(brw, By.TAG_NAME, 'core-transclude')
+
     # showing all recipes
     elementsToBeFound = int(brw.find_element(By.CLASS_NAME, 'items-start').text.split('\n')[-1].split(' ')[0])
     previousElements = 0
@@ -148,13 +319,13 @@ def run(webdriverfile, outputdir, separate_json):
         brw.execute_script("arguments[0].setAttribute(arguments[1], arguments[2]);", el, 'href', './recipes/{}.html'.format(recipeID))
 
     # removing search bar
-    try: brw.execute_script("var element = arguments[0];element.parentNode.removeChild(element);", brw.find_element(By.TAG_NAME, 'core-search-bar'))
-    except: pass
+    removeElements(brw, By.TAG_NAME, 'search-bar')
 
     # removing scripts
-    for s in brw.find_elements(By.TAG_NAME, 'script'):
-        try: brw.execute_script("var element = arguments[0];element.parentNode.removeChild(element);", s)
-        except: pass
+    removeElements(brw, By.TAG_NAME, 'script')
+
+    #cleaning html for local saving and printing
+    cleanHtml(brw)
 
     # saving the list to file
     listToFile(brw, outputdir)
@@ -176,10 +347,11 @@ def run(webdriverfile, outputdir, separate_json):
             brw.get(recipeURL)
             time.sleep(PAGELOAD_TO)
             # removing the base href header
-            try: brw.execute_script("var element = arguments[0];element.parentNode.removeChild(element);", brw.find_element(By.TAG_NAME, 'base'))
-            except: pass
+            removeElements(brw,By.TAG_NAME, 'base')
+            
             # removing the name
-            brw.execute_script("var element = arguments[0];element.parentNode.removeChild(element);", brw.find_element(By.TAG_NAME, 'core-user-profile'))
+            removeElements(brw,By.TAG_NAME, 'core-transclude')
+            
             # changing the top url
             brw.execute_script("arguments[0].setAttribute(arguments[1], arguments[2]);", brw.find_element(By.CLASS_NAME, 'page-header__home'), 'href', '../../index.html')
             # saving recipe image
@@ -188,8 +360,18 @@ def run(webdriverfile, outputdir, separate_json):
             # change the image url to local
             brw.execute_script("arguments[0].setAttribute(arguments[1], arguments[2]);", brw.find_element(By.CLASS_NAME, 'core-tile__image'), 'srcset', '')
             brw.execute_script("arguments[0].setAttribute(arguments[1], arguments[2]);", brw.find_element(By.CLASS_NAME, 'core-tile__image'), 'src', local_img_path)
+
+            #cleaning html for local saving and printing
+            cleanHtml(brw)
+
             # saving the file
             recipeToFile(brw, '{}recipes/{}.html'.format(outputdir, recipeID))
+
+            if pdf:
+                # exporting in pdf
+                print('[CD] Exporting recipe in PDF file')
+                recipeToPdf(brw, '{}recipes/{}.pdf'.format(outputdir, recipeID))
+
             # extracting JSON info
             recipe = recipeToJSON(brw, recipeID)
             # saving JSON file, if needed
@@ -198,6 +380,7 @@ def run(webdriverfile, outputdir, separate_json):
                 with open('{}recipes/{}.json'.format(outputdir, recipeID), 'w') as outfile: json.dump(recipe, outfile)
             else:
                 recipeData.append(recipe)
+                        
             # printing information
             c += 1
             if c % 10 == 0: print('Dumped recipes: {}/{}'.format(c, len(recipesURLs)))
@@ -208,19 +391,66 @@ def run(webdriverfile, outputdir, separate_json):
         print('[CD] Writing recipes to JSON file')
         with open('{}data.json'.format(outputdir), 'w') as outfile: json.dump(recipeData, outfile)
 
-    # logging out
-    logoutURL = 'https://cookidoo.{}/profile/logout'.format(locale)
-    brw.get(logoutURL)
-    time.sleep(PAGELOAD_TO)
+    if cookies is None:
+        # logging out
+        logoutURL = 'https://cookidoo.{}/profile/logout'.format(locale)
+        brw.get(logoutURL)
+        time.sleep(PAGELOAD_TO)
 
     # closing session
     print('[CD] Closing session\n[CD] Goodbye!')
     brw.close()
 
 if  __name__ =='__main__':
+
     parser = argparse.ArgumentParser(description='Dump Cookidoo recipes from a valid account')
-    parser.add_argument('webdriverfile', type=str, help='the path to the Chrome WebDriver file')
-    parser.add_argument('outputdir', type=str, help='the output directory')
-    parser.add_argument('-s', '--separate-json', action='store_true', help='Create a separate JSON file for each recipe; otherwise, a single data file will be generated')
+
+    parser.add_argument('webdriverfile', type=str, nargs='?', 
+                        help='the path to the Chrome WebDriver file. Default: \'chromedriver\', Env var: CD_WEBDRIVER', 
+                        default=os.environ.get('CD_WEBDRIVER', 'chromedriver'))
+    
+    parser.add_argument('outputdir', type=str, nargs='?', 
+                        help='the output directory, if a search query is specified it will be used directly to save the recipes. Default: \'recipes\', Env var: CD_OUTPUTDIR', 
+                        default=os.environ.get('CD_OUTPUTDIR', 'recipes'))
+
+    parser.add_argument('-o', '--subdir', type=str, 
+                        help='saves recipes inside outputdir in a specified subdirectory, useful for categoryzing. No default - it will be asked -, Env var: CD_SUBDIR',
+                        default=os.environ.get('CD_SUBDIR', None))
+
+    parser.add_argument('-s', '--separate-json', action='store_true', 
+                        help='creates a separate JSON file for each recipe; otherwise, a single data file will be generated. Default: \'False\', Env var: CD_SEPARATE_JSON',
+                        default=(os.environ.get('CD_SEPARATE_JSON', None) != None))
+    
+    parser.add_argument('-l', '--locale', type=str, 
+                        help='sets locale of cookidoo website (end of domain, ex. de, it, etc.)). No default, Env var: CD_LOCALE',
+                        default=os.environ.get('CD_LOCALE', None))
+        
+    parser.add_argument('-p', '--pdf', action='store_true', default=(os.environ.get('CD_PDF',None) != None), 
+                        help='saves recipe in pdf format too. Default: \'False\', Env var: CD_PDF')
+    
+    parser.add_argument('-q','--searchquery', type=str, 
+                        help='the search query to use copied from the site after setting filter, without the domain (e.g. something like "/search/?context=recipes&categories=VrkNavCategory-RPF-013")')
+
+    parser.add_argument('--headless', action='store_true', 
+                        help='runs Chrome in headless mode, needs --searchquery specified and either --login or a {} saved with --save-cookies previously. Default: \'False\', Env var: CD_HEADLESS'.format(COOKIES_FILE),
+                        default=(os.environ.get('CD_HEADLESS', None) != None))
+
+    parser.add_argument('--login', action='store_true', 
+                        help='interactive terminal login')
+    
+    parser.add_argument('--save-cookies', action='store_true', 
+                        help='store cookies in local {} file then exits; to be used with --headless or to avoid login on subsequent runs'.format(COOKIES_FILE))
+    
+    
     args = parser.parse_args()
-    run(args.webdriverfile, args.outputdir, args.separate_json)
+
+    if (not args.login and args.headless and args.searchquery is None):
+        parser.error('--headless requires --searchquery to be specified when run without --login')
+        exit(-1)
+
+    print('[CD] Starting cookidump with arguments:')
+
+    for arg in vars(args):
+        print('[CD]    {} = {}'.format(arg, getattr(args, arg)))
+
+    run(args.webdriverfile, args.outputdir, args.subdir, args.separate_json, args.searchquery, args.locale, args.pdf, args.save_cookies, args.headless, args.login)
